@@ -1,0 +1,26 @@
+deepspeed --module openrlhf.cli.train_ppo \
+  --pretrain /data4/mxfeng/hf_models/Qwen2-1.5B \
+  --reward_pretrain /data4/mxfeng/hf_models/Qwen2-1.5B \
+  --save_path ./checkpoint/llama-3-8b-rlhf \
+  --save_steps -1 \
+  --logging_steps 1 \
+  --eval_steps -1 \
+  --micro_train_batch_size 2 \
+  --train_batch_size 128 \
+  --micro_rollout_batch_size 4 \
+  --rollout_batch_size 1024 \
+  --max_epochs 1 \
+  --prompt_max_len 1024 \
+  --generate_max_len 512 \
+  --zero_stage 3 \
+  --bf16 \
+  --actor_learning_rate 5e-7 \
+  --critic_learning_rate 9e-6 \
+  --init_kl_coef 0.01 \
+  --prompt_data /data4/mxfeng/hf_datasets/PKU-SafeRLHF-prompt-converted \
+  --input_key context_messages \
+  --apply_chat_template \
+  --max_samples 20000 \
+  --normalize_reward \
+  --gradient_checkpointing \
+  --load_checkpoint

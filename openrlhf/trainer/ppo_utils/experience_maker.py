@@ -1,4 +1,4 @@
-import logging
+import re
 import time
 from abc import ABC
 from copy import deepcopy
@@ -8,7 +8,6 @@ from typing import List, Optional, Tuple, Union
 import ray
 import torch
 import torch.nn as nn
-from tqdm import tqdm
 
 from openrlhf.models.actor import Actor
 from openrlhf.models.utils import compute_reward, masked_mean
@@ -418,3 +417,348 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         "Ensure all experience has been send to critic"
         ray.get(self._ref)
         self._ref = None
+
+
+def restore_gemma_conversation(formatted_prompt):
+    # 移除开头的 BOS token
+    formatted_prompt = formatted_prompt.lstrip()
+
+    # 使用正则表达式分割对话轮次
+    turns = re.split(r"<start_of_turn>|<end_of_turn>\n", formatted_prompt)
+
+    # 过滤掉空字符串
+    turns = [turn.strip() for turn in turns if turn.strip()]
+
+    conversation = []
+    for turn in turns:
+        if turn.startswith("user\n"):
+            role = "user"
+            content = turn[5:].strip()
+        elif turn.startswith("model\n"):
+            role = "assistant"
+            content = turn[6:].strip()
+        else:
+            continue  # 跳过不符合格式的内容
+
+        conversation.append({"role": role, "content": content})
+
+    return conversation
+
+
+def restore_llama_conversation(formatted_prompt):
+    # 使用正则表达式匹配各个角色的消息
+    pattern = r"<\|(user|system|assistant)\|>\n(.*?)(?=<\||$)"
+    matches = re.findall(pattern, formatted_prompt, re.DOTALL)
+
+    conversation = []
+    for role, content in matches:
+        # 移除内容末尾的所有 EOS token
+        content = re.sub(r"(?:</s>)+$", "", content.strip())
+        conversation.append({"role": role, "content": content})
+
+    return conversation
+
+
+def restore_conversation(formatted_prompt):
+    # 使用正则表达式匹配各个角色的消息
+    pattern = r"<\|im_start\|>(system|user|assistant)\n(.*?)<\|im_end\|>"
+    matches = re.findall(pattern, formatted_prompt, re.DOTALL)
+
+    conversation = []
+    for role, content in matches:
+        # 移除内容的首尾空白字符
+        content = content.strip()
+        conversation.append({"role": role, "content": content})
+
+    return conversation
+
+
+class SMACExperienceMaker(NaiveExperienceMaker):
+    def __init__(self, *args, aligner: Actor, initial_aligner: Actor, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.aligner = aligner
+        self.initial_aligner = initial_aligner
+    @torch.no_grad()
+    def make_experience(self, prompts: Union[str, List[str]], **generate_kwargs) -> Experience:
+        self.actor.eval()
+        self.critic.eval()
+        self.initial_model.eval()
+        if self.reward_model is not None:
+            self.reward_model.eval()
+
+        inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
+        sequences, attention_mask, action_mask = self.actor.generate(** inputs, **generate_kwargs)
+        num_actions = action_mask.size(1)
+        action_log_probs = self.actor(sequences, num_actions, attention_mask)
+        base_action_log_probs = self.initial_model(sequences, num_actions, attention_mask)
+        value = self.critic(sequences, action_mask, attention_mask)
+
+        if self.remote_rm_url is not None:
+            queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=False)
+            r = remote_rm_fn(self.remote_rm_url, queries=queries).to(device=action_log_probs.device)
+        else:
+            r = self.reward_model(sequences, attention_mask)
+
+        reward, kl = compute_reward(
+            r,
+            self.kl_ctl.value,
+            action_log_probs,
+            base_action_log_probs,
+            action_mask=action_mask,
+        )
+        advantage, returns = self.get_advantages_and_returns(
+            value,
+            reward,
+            action_mask,
+            generate_kwargs["gamma"],
+            generate_kwargs["lambd"],
+        )
+
+        info = {
+            "kl": masked_mean(kl, action_mask, dim=-1),
+            "reward": r,
+            "return": reward.sum(dim=-1),
+            "response_length": action_mask.float().sum(dim=-1),
+            "total_length": attention_mask.float().sum(dim=-1),
+        }
+
+        self.actor.train()
+        self.critic.train()
+
+        return Experience(
+            sequences,
+            action_log_probs,
+            value,
+            returns,
+            advantage,
+            attention_mask,
+            action_mask,
+            info,
+        )
+
+    @torch.no_grad()
+    def make_aligner_experience(self, prompts: Union[str, List[str]], actor_sequences: torch.Tensor, ** generate_kwargs) -> Experience:
+        self.aligner.eval()
+        self.initial_aligner.eval()
+        self.critic.eval()
+        if self.reward_model is not None:
+            self.reward_model.eval()
+
+        prompt_length = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")["input_ids"].size(1)
+        answers = self.tokenizer.batch_decode(actor_sequences[:, prompt_length:], skip_special_tokens=True)
+        conversations = [restore_conversation(formatted_prompt) for formatted_prompt in prompts]
+        new_conversations = []
+        for i, answer in enumerate(answers):
+            if conversations[i][-1]["content"] == "":
+                conversations[i][-1]["content"] = answer
+            else:
+                conversations[i].append({"role": "assistant", "content": answer})
+            new_conversations.append(conversations[i].copy())
+            new_conversations[i].append(
+                {
+                    "role": "user",
+                    "content": "Based on the above conversation, REVISE the answer from the assisant to make it more helpful, honest, and harmless",
+                }
+            )
+        new_prompts = [
+            self.tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+            for conversation in new_conversations
+        ]
+        new_inputs = self.tokenize_fn(new_prompts, self.prompt_max_len, device="cuda")
+        new_sequences, new_attention_mask, new_action_mask = self.aligner.generate(**new_inputs, ** generate_kwargs)
+        num_new_actions = new_action_mask.size(1)
+        new_prompt_length = new_inputs["input_ids"].size(1)
+
+        new_action_log_probs = self.aligner(new_sequences, num_new_actions, new_attention_mask)
+        new_base_action_log_probs = self.initial_aligner(new_sequences, num_new_actions, new_attention_mask)
+        new_value = self.critic(new_sequences, new_action_mask, new_attention_mask)
+
+        if self.remote_rm_url is not None:
+            queries = self.tokenizer.batch_decode(new_sequences.cpu(), skip_special_tokens=False)
+            r = remote_rm_fn(self.remote_rm_url, queries=queries).to(device=new_action_log_probs.device)
+        else:
+            spliced_sequences = torch.cat([actor_sequences[:, :prompt_length], new_sequences[:, new_prompt_length:]], dim=1)
+            spliced_attention_mask = torch.cat(
+                [new_attention_mask[:, :prompt_length], new_attention_mask[:, new_prompt_length:]], dim=1
+            )
+            r = self.reward_model(spliced_sequences, spliced_attention_mask)
+
+        new_reward, new_kl = compute_reward(
+            r,
+            self.kl_ctl.value,
+            new_action_log_probs,
+            new_base_action_log_probs,
+            action_mask=new_action_mask,
+        )
+        new_advantage, new_returns = self.get_advantages_and_returns(
+            new_value,
+            new_reward,
+            new_action_mask,
+            generate_kwargs["gamma"],
+            generate_kwargs["lambd"],
+        )
+
+        new_info = {
+            "kl": masked_mean(new_kl, new_action_mask, dim=-1),
+            "reward": r,
+            "return": new_reward.sum(dim=-1),
+            "response_length": new_action_mask.float().sum(dim=-1),
+            "total_length": new_attention_mask.float().sum(dim=-1),
+        }
+
+        self.aligner.train()
+
+        return Experience(
+            new_sequences,
+            new_action_log_probs,
+            new_value,
+            new_returns,
+            new_advantage,
+            new_attention_mask,
+            new_action_mask,
+            new_info,
+        )
+    # @torch.no_grad()
+    # def make_experience(self, prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience]:
+    #     # def make_experience(self, prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience, Experience]:
+    #     self.actor.eval()
+    #     self.critic.eval()
+    #     self.initial_model.eval()
+    #     self.aligner.eval()
+    #     self.initial_aligner.eval()
+    #     if self.reward_model is not None:
+    #         self.reward_model.eval()
+
+    #     # Actor: generate seq
+    #     inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
+    #     sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
+    #     num_actions = action_mask.size(1)
+    #     # Actor: log probs
+    #     action_log_probs = self.actor(sequences, num_actions, attention_mask)
+    #     # Actor: init log probs
+    #     base_action_log_probs = self.initial_model(sequences, num_actions, attention_mask)
+    #     # Actor:  values
+    #     value = self.critic(sequences, action_mask, attention_mask)
+
+    #     # Aligner: generate seq
+    #     prompt_length = inputs["input_ids"].size(1)
+    #     answers = self.tokenizer.batch_decode(sequences[:, prompt_length:], skip_special_tokens=True)
+    #     conversations = [restore_conversation(formatted_prompt) for formatted_prompt in prompts]
+    #     new_conversations = []
+    #     for i, answer in enumerate(answers):
+    #         answer = answers[i]
+    #         if conversations[i][-1]["content"] == "":
+    #             conversations[i][-1]["content"] = answer
+    #         else:
+    #             conversations[i].append({"role": "assistant", "content": answer})
+    #         new_conversations.append(conversations[i].copy())
+    #         new_conversations[i].append(
+    #             {
+    #                 "role": "user",
+    #                 "content": "Based on the above conversation, REVISE the answer from the assisant to make it more helpful, honest, and harmless",
+    #             }
+    #         )
+    #     new_prompts = [
+    #         self.tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+    #         for conversation in new_conversations
+    #     ]
+    #     for p, np in zip(prompts, new_prompts):
+    #         assert p == np[: len(p)]
+    #     new_inputs = self.tokenize_fn(new_prompts, self.prompt_max_len, device="cuda")
+    #     new_sequences, new_attention_mask, new_action_mask = self.aligner.generate(**new_inputs, **generate_kwargs)
+    #     num_new_actions = new_action_mask.size(1)
+    #     new_prompt_length = new_inputs["input_ids"].size(1)
+
+    #     # Aligner: log probs
+    #     new_action_log_probs = self.aligner(new_sequences, num_new_actions, new_attention_mask)
+    #     # Aligner: init log probs
+    #     new_base_action_log_probs = self.initial_aligner(new_sequences, num_new_actions, new_attention_mask)
+    #     # Aligner:  values
+    #     new_value = self.critic(new_sequences, new_action_mask, new_attention_mask)
+    #     corrections = self.tokenizer.batch_decode(new_sequences[:, new_prompt_length:], skip_special_tokens=True)
+
+    #     # rewards
+    #     if self.remote_rm_url is not None:
+    #         # remote RM
+    #         queries = self.tokenizer.batch_decode(sequences.cpu(), skip_special_tokens=False)
+    #         r = remote_rm_fn(self.remote_rm_url, queries=queries).to(device=action_log_probs.device)
+    #         # queries2 = self.tokenizer.batch_decode(new_sequences.cpu(), skip_special_tokens=False)
+    #         # r2 = remote_rm_fn(self.remote_rm_url, queries=queries2).to(device=action_log_probs.device)
+
+    #     else:
+    #         # local RM
+    #         r1 = self.reward_model(sequences, attention_mask)
+    #         spliced_sequences = torch.cat([sequences[:, :prompt_length], new_sequences[:, new_prompt_length:]], dim=1)
+    #         spliced_attention_mask = torch.cat(
+    #             [attention_mask[:, :prompt_length], new_attention_mask[:, new_prompt_length:]], dim=1
+    #         )
+    #         r2 = self.reward_model(spliced_sequences, spliced_attention_mask)
+    #         r = (r1 + r2) / 2
+
+    #     reward, kl = compute_reward(
+    #         r,
+    #         self.kl_ctl.value,
+    #         action_log_probs,
+    #         base_action_log_probs,
+    #         action_mask=action_mask,
+    #     )
+    #     new_reward, new_kl = compute_reward(
+    #         r,
+    #         self.kl_ctl.value,
+    #         new_action_log_probs,
+    #         new_base_action_log_probs,
+    #         action_mask=new_action_mask,
+    #     )
+    #     advantage, returns = self.get_advantages_and_returns(
+    #         value,
+    #         reward,
+    #         action_mask,
+    #         generate_kwargs["gamma"],
+    #         generate_kwargs["lambd"],
+    #     )
+    #     new_advantage, new_returns = self.get_advantages_and_returns(
+    #         new_value,
+    #         new_reward,
+    #         new_action_mask,
+    #         generate_kwargs["gamma"],
+    #         generate_kwargs["lambd"],
+    #     )
+
+    #     info = {
+    #         "kl": masked_mean(kl, action_mask, dim=-1),
+    #         "reward": r,
+    #         "return": reward.sum(dim=-1),
+    #         "response_length": action_mask.float().sum(dim=-1),
+    #         "total_length": attention_mask.float().sum(dim=-1),
+    #     }
+    #     new_info = {
+    #         "kl": masked_mean(new_kl, new_action_mask, dim=-1),
+    #         "reward": r,
+    #         "return": new_reward.sum(dim=-1),
+    #         "response_length": new_action_mask.float().sum(dim=-1),
+    #         "total_length": new_attention_mask.float().sum(dim=-1),
+    #     }
+    #     # reset model state
+    #     self.actor.train()
+    #     self.critic.train()
+    #     self.aligner.train()
+
+    #     return Experience(
+    #         sequences,
+    #         action_log_probs,
+    #         value,
+    #         returns,
+    #         advantage,
+    #         attention_mask,
+    #         action_mask,
+    #         info,
+    #     ), Experience(
+    #         new_sequences,
+    #         new_action_log_probs,
+    #         new_value,
+    #         new_returns,
+    #         new_advantage,
+    #         new_attention_mask,
+    #         new_action_mask,
+    #         new_info,
+    #     )
