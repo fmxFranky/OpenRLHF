@@ -478,6 +478,7 @@ class SMACExperienceMaker(NaiveExperienceMaker):
         super().__init__(*args, **kwargs)
         self.aligner = aligner
         self.initial_aligner = initial_aligner
+
     @torch.no_grad()
     def make_experience(self, prompts: Union[str, List[str]], **generate_kwargs) -> Experience:
         self.actor.eval()
@@ -487,7 +488,7 @@ class SMACExperienceMaker(NaiveExperienceMaker):
             self.reward_model.eval()
 
         inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
-        sequences, attention_mask, action_mask = self.actor.generate(** inputs, **generate_kwargs)
+        sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
         num_actions = action_mask.size(1)
         action_log_probs = self.actor(sequences, num_actions, attention_mask)
         base_action_log_probs = self.initial_model(sequences, num_actions, attention_mask)
@@ -537,7 +538,9 @@ class SMACExperienceMaker(NaiveExperienceMaker):
         )
 
     @torch.no_grad()
-    def make_aligner_experience(self, prompts: Union[str, List[str]], actor_sequences: torch.Tensor, ** generate_kwargs) -> Experience:
+    def make_aligner_experience(
+        self, prompts: Union[str, List[str]], actor_sequences: torch.Tensor, **generate_kwargs
+    ) -> Experience:
         self.aligner.eval()
         self.initial_aligner.eval()
         self.critic.eval()
@@ -565,7 +568,7 @@ class SMACExperienceMaker(NaiveExperienceMaker):
             for conversation in new_conversations
         ]
         new_inputs = self.tokenize_fn(new_prompts, self.prompt_max_len, device="cuda")
-        new_sequences, new_attention_mask, new_action_mask = self.aligner.generate(**new_inputs, ** generate_kwargs)
+        new_sequences, new_attention_mask, new_action_mask = self.aligner.generate(**new_inputs, **generate_kwargs)
         num_new_actions = new_action_mask.size(1)
         new_prompt_length = new_inputs["input_ids"].size(1)
 
@@ -577,7 +580,9 @@ class SMACExperienceMaker(NaiveExperienceMaker):
             queries = self.tokenizer.batch_decode(new_sequences.cpu(), skip_special_tokens=False)
             r = remote_rm_fn(self.remote_rm_url, queries=queries).to(device=new_action_log_probs.device)
         else:
-            spliced_sequences = torch.cat([actor_sequences[:, :prompt_length], new_sequences[:, new_prompt_length:]], dim=1)
+            spliced_sequences = torch.cat(
+                [actor_sequences[:, :prompt_length], new_sequences[:, new_prompt_length:]], dim=1
+            )
             spliced_attention_mask = torch.cat(
                 [new_attention_mask[:, :prompt_length], new_attention_mask[:, new_prompt_length:]], dim=1
             )
@@ -618,6 +623,7 @@ class SMACExperienceMaker(NaiveExperienceMaker):
             new_action_mask,
             new_info,
         )
+
     # @torch.no_grad()
     # def make_experience(self, prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience]:
     #     # def make_experience(self, prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience, Experience]:
